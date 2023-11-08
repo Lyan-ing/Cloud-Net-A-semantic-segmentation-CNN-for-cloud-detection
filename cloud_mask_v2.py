@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import numpy as np
 from osgeo import gdal, ogr, osr
@@ -11,7 +13,10 @@ import tqdm
 np.seterr(divide='ignore', invalid='ignore')
 
 logger.add('logger/cloud_detection_error.logs', level='ERROR')
-
+cloud_seg_mask_for_different_sensor = {}
+if os.path.exists('cloud_seg_mask_for_different_sensor.json'):
+    with open('cloud_seg_mask_for_different_sensor.json', 'r', encoding='utf-8') as js:
+        cloud_seg_mask_for_different_sensor = json.load(js)
 
 def get_alpha(input_image):
     ds = gdal.Open(input_image)
@@ -31,6 +36,7 @@ def detect_clouds(input_image, shapefilename):
         # return
         # 打开遥感影像
         ds_vrt = gdal.Warp('', input_image, format='vrt')
+        sensor_type = os.path.basename(input_image).split('_')[0]
         res = 0.0001
         options = gdal.BuildVRTOptions(xRes=res, yRes=res, resampleAlg=gdal.GRA_Average)
         dataset = gdal.BuildVRT('', ds_vrt)
@@ -55,7 +61,6 @@ def detect_clouds(input_image, shapefilename):
         data_red = dataset.GetRasterBand(3).ReadAsArray()
         data_nir = dataset.GetRasterBand(4).ReadAsArray()
 
-
         mask_nodata = None
 
         # mask_band = bandred.GetMaskBand()
@@ -71,29 +76,114 @@ def detect_clouds(input_image, shapefilename):
                 mask_nodata = data_red == 0
 
         # rgb计算灰度
-        data_gray = 0.2989 * data_red + 0.5870 * data_green + 0.1140 * data_blue
+        # data_gray = 0.2989 * data_red + 0.5870 * data_green + 0.1140 * data_blue
 
-        data_gray = cv2.GaussianBlur(data_gray, (3, 3), 0)
+        # data_gray = cv2.GaussianBlur(data_gray, (3, 3), 0)
         data_red = cv2.GaussianBlur(data_red, (5, 5), 0)
         data_nir = cv2.GaussianBlur(data_nir, (5, 5), 0)
 
         data_nir_nor = (data_nir - data_nir.min()) / (data_nir.max() - data_nir.min())
-        data_red_nor = (data_red - data_red.min()) / (data_red.max() - data_red.min())
+        # data_red_nor = (data_red - data_red.min()) / (data_red.max() - data_red.min())
 
-        _cloud_mask_data = (data_nir - data_red) / (data_red + data_nir)
+        _cloud_mask_data = (data_nir - data_red) / (data_red + data_nir).clip(1)
+        # _cloud_mask_data = (data_nir_nor - data_red_nor) / (data_red_nor + data_nir_nor)
         # cloud_mask_data = (data_gray-data_red)/(data_gray+data_nir)
 
         cloud_mask_data = np.zeros_like(_cloud_mask_data)
+        # _cloud_mask_data = (_cloud_mask_data - _cloud_mask_data.min()) / (
+        #             _cloud_mask_data.max() - _cloud_mask_data.min())
+        # print(_cloud_mask_data.max())
+        choose_threshold = False
+        if sensor_type not in cloud_seg_mask_for_different_sensor:
+            choose_threshold = True
+        else:
+            sensor_type_value = cloud_seg_mask_for_different_sensor[sensor_type]
+            is_cloud_value = sensor_type_value['threshold']
+            nir_value = sensor_type_value['nir_value']
+        if choose_threshold:
+            def nothing(x):
+                pass
 
-        is_cloud_value = 0
-        cloud_mask_data[_cloud_mask_data > is_cloud_value] = 1
-        cloud_mask_data[_cloud_mask_data <= is_cloud_value] = 0
+            cv2.namedWindow('Image')
+            cv2.namedWindow('mask')
+            cv2.resizeWindow('mask', 600, 600)
 
-        # cloud_mask_data[data_nir<200] = 1 
-        # cloud_mask_data[data_nir<1000]=1
-        # cloud_mask_data[data_gray<1000]=1
+            # 创建一个滑动条，名为 'R'，范围为 0-255，初始值为 100
+            cv2.createTrackbar('threshold', 'mask', 0, 100, nothing)
+            cv2.createTrackbar('nir', 'mask', 0, 100, nothing)
+            Print_flag = True
+            print()
+            while (1):
+                k = cv2.waitKey(1) & 0xFF
+                # 将波段数据合并成一个图像
+                rgb = np.dstack((data_blue, data_green, data_red))
 
-        if 0:
+                # 将 NumPy 数组转换为 OpenCV 图像
+                rgb_cv = cv2.normalize(rgb, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                resize_img = cv2.resize(rgb_cv, (600, 600))
+
+
+                # 在 OpenCV 窗口中显示图像
+                cv2.imshow('Image', resize_img)
+
+                is_cloud_value = cv2.getTrackbarPos('threshold', 'mask') / 10
+                nir_value = cv2.getTrackbarPos('nir', 'mask') / 100
+                cloud_mask = (_cloud_mask_data > is_cloud_value) & (data_nir_nor > nir_value)
+
+                cloud_mask_data[cloud_mask] = 1
+                cloud_mask_data[~cloud_mask] = 0
+                if Print_flag:
+                    logger.info("按Q 确认选值 按A查看噪点优化后的结果")
+                    Print_flag = False
+                if k == ord('a'):
+                    MORPH_ELLIPSE_FLAG = True
+                else:
+                    MORPH_ELLIPSE_FLAG = False
+                if MORPH_ELLIPSE_FLAG:
+                    logger.info("=============噪点优化中，请等候================")
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))  # 定义矩形结构元素
+
+                    # cloud_mask_data = cv2.morphologyEx(cloud_mask_data, cv2.MORPH_OPEN, kernel,iterations=1)
+                    cloud_mask_data = cv2.morphologyEx(cloud_mask_data, cv2.MORPH_CLOSE, kernel, iterations=1)
+                    # cloud_mask_data = cv2.morphologyEx(cloud_mask_data, cv2.MORPH_GRADIENT, kernel,iterations=1)
+
+                    cloud_mask_data = cv2.erode(cloud_mask_data, kernel, iterations=3)
+                    # cloud_mask_data = cv2.dilate(cloud_mask_data, kernel, iterations=1)
+                    cloud_mask_data[cloud_mask_data <= 0.5] = 0
+                    cloud_mask_data[cloud_mask_data > 0.5] = 1
+                    mask = cv2.resize(cloud_mask_data, (600, 600))
+
+                    cv2.imshow('mask', mask)
+                    # print()
+                    logger.info('按C重新选择阈值或确认阈值')
+                    while True:
+                        kk = cv2.waitKey(1) & 0xFF
+                        # print('按C重新选择阈值')
+                        if kk == ord('c'):
+                            Print_flag = True
+                            break
+
+                else:
+                    mask = cv2.resize(cloud_mask_data, (600, 600))
+
+                    cv2.imshow('mask', mask)
+                # if cv2.getTrackbarPos(switch, 'mask') == 1:
+                #     break
+                if k == 27 or k==ord('q'):
+                    break
+                # 获取滑动条的位置
+
+            # return None
+            cv2.destroyAllWindows()
+            if sensor_type not in cloud_seg_mask_for_different_sensor:
+                cloud_seg_mask_for_different_sensor[sensor_type] = {'nir_value': nir_value, 'threshold': is_cloud_value}
+        else:
+            cloud_mask = (_cloud_mask_data > is_cloud_value) & (data_nir_nor > nir_value)
+            # 计算云占比
+            cloud_mask_data[cloud_mask] = 1
+            cloud_mask_data[~cloud_mask] = 0
+            # 使用闭运算优化噪点
+            logger.info("=============噪点优化中，请等候================")
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))  # 定义矩形结构元素
 
             # cloud_mask_data = cv2.morphologyEx(cloud_mask_data, cv2.MORPH_OPEN, kernel,iterations=1)
@@ -103,6 +193,14 @@ def detect_clouds(input_image, shapefilename):
             cloud_mask_data = cv2.erode(cloud_mask_data, kernel, iterations=3)
             # cloud_mask_data = cv2.dilate(cloud_mask_data, kernel, iterations=1)
             cloud_mask_data[cloud_mask_data <= 0.5] = 0
+            cloud_mask_data[cloud_mask_data > 0.5] = 1
+        # cloud_mask_data[data_nir<200] = 1
+        # cloud_mask_data[data_nir<1000]=1
+        # cloud_mask_data[data_gray<1000]=1
+
+        # 计算云占比
+        cloud_rate = round((cloud_mask.sum() / (width * height)) * 100, 2)
+
 
         if 1:
             # 关闭数据集
@@ -140,6 +238,10 @@ def detect_clouds(input_image, shapefilename):
         polygon_list = getVector(cloud_mask_data)
         # shapefilename = mask[:-4]+'.shp'
         write_shapefile(polygon_bounds, polygon_list, shapefilename, geotransform, projection)
+
+        with open(os.path.join(args.tif_path, 'cloud_rate.csv'), 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([input_image, cloud_rate])
         return True
     except Exception as ex:
         logger.error(f'云量检测失败：{input_image}')
@@ -261,6 +363,8 @@ if __name__ == '__main__':
         shp = '.'.join(tif.split('.')[:-1]) + '_cloud.shp'
         if not detect_clouds(tif, shp):
             erro_list.append(tif)
+    with open('cloud_seg_mask_for_different_sensor.json', 'w', encoding='utf-8') as clo:
+        json.dump(cloud_seg_mask_for_different_sensor, clo, indent=4)
     if erro_list:
         logger.info(f'云量检测计算完成,有{len(erro_list)}个文件生成失败，请检测日志文件')
     else:
